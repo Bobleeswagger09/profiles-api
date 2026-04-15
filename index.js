@@ -1,12 +1,34 @@
 const express = require("express");
 const axios = require("axios");
 const { Pool } = require("pg");
-const { v7: uuidv7 } = require("uuid");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
+
+// UUID v7 — time-ordered, no extra package needed
+function uuidv7() {
+  const now = Date.now();
+  const timeHigh = Math.floor(now / 0x100000000);
+  const timeLow = now >>> 0;
+  const rand = new Uint8Array(10);
+  crypto.getRandomValues(rand);
+  const hex = [
+    timeHigh.toString(16).padStart(8, "0"),
+    timeLow.toString(16).padStart(8, "0"),
+  ].join("");
+  const t1 = hex.slice(0, 8);
+  const t2 = hex.slice(8, 12);
+  const t3 = "7" + hex.slice(13, 16);
+  const r1 =
+    ((rand[0] & 0x3f) | 0x80).toString(16).padStart(2, "0") +
+    rand[1].toString(16).padStart(2, "0");
+  const r2 = Array.from(rand.slice(2, 8))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  return `${t1}-${t2}-${t3}-${r1}-${r2}`;
+}
 
 // CORS
 app.use((req, res, next) => {
@@ -17,7 +39,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// Database — lazy init so server starts even if DB is slow
+// Database
 let pool;
 function getPool() {
   if (!pool) {
@@ -29,7 +51,6 @@ function getPool() {
   return pool;
 }
 
-// Create table
 async function initDB() {
   const db = getPool();
   await db.query(`
@@ -49,7 +70,6 @@ async function initDB() {
   console.log("DB ready");
 }
 
-// Age group classifier
 function getAgeGroup(age) {
   if (age <= 12) return "child";
   if (age <= 19) return "teenager";
@@ -61,22 +81,28 @@ function getAgeGroup(age) {
 app.post("/api/profiles", async (req, res) => {
   const name = req.body ? req.body.name : undefined;
 
-  // 422 — non-string
   if (name !== undefined && typeof name !== "string") {
-    return res.status(422).json({ status: "error", message: "Invalid type: name must be a string" });
+    return res
+      .status(422)
+      .json({
+        status: "error",
+        message: "Invalid type: name must be a string",
+      });
   }
 
-  // 400 — missing or empty
   if (!name || name.trim() === "") {
-    return res.status(400).json({ status: "error", message: "Missing required field: name" });
+    return res
+      .status(400)
+      .json({ status: "error", message: "Missing required field: name" });
   }
 
   const trimmedName = name.trim().toLowerCase();
   const db = getPool();
 
-  // Idempotency — check if profile already exists
   try {
-    const existing = await db.query("SELECT * FROM profiles WHERE name = $1", [trimmedName]);
+    const existing = await db.query("SELECT * FROM profiles WHERE name = $1", [
+      trimmedName,
+    ]);
     if (existing.rows.length > 0) {
       return res.status(200).json({
         status: "success",
@@ -86,34 +112,59 @@ app.post("/api/profiles", async (req, res) => {
     }
   } catch (err) {
     console.error("DB check error:", err.message);
-    return res.status(500).json({ status: "error", message: "Database error: " + err.message });
+    return res
+      .status(500)
+      .json({ status: "error", message: "Database error: " + err.message });
   }
 
-  // Call all 3 APIs in parallel
   try {
     const [genderRes, agifyRes, nationalizeRes] = await Promise.all([
-      axios.get("https://api.genderize.io", { params: { name: trimmedName }, timeout: 5000, validateStatus: () => true }),
-      axios.get("https://api.agify.io", { params: { name: trimmedName }, timeout: 5000, validateStatus: () => true }),
-      axios.get("https://api.nationalize.io", { params: { name: trimmedName }, timeout: 5000, validateStatus: () => true }),
+      axios.get("https://api.genderize.io", {
+        params: { name: trimmedName },
+        timeout: 5000,
+        validateStatus: () => true,
+      }),
+      axios.get("https://api.agify.io", {
+        params: { name: trimmedName },
+        timeout: 5000,
+        validateStatus: () => true,
+      }),
+      axios.get("https://api.nationalize.io", {
+        params: { name: trimmedName },
+        timeout: 5000,
+        validateStatus: () => true,
+      }),
     ]);
 
     const genderData = genderRes.data;
     const agifyData = agifyRes.data;
     const nationalizeData = nationalizeRes.data;
 
-    // Validate Genderize
     if (!genderData.gender || genderData.count === 0) {
-      return res.status(200).json({ status: "error", message: "No gender prediction available for the provided name" });
+      return res
+        .status(200)
+        .json({
+          status: "error",
+          message: "No gender prediction available for the provided name",
+        });
     }
 
-    // Validate Agify
     if (agifyData.age === null || agifyData.age === undefined) {
-      return res.status(200).json({ status: "error", message: "No age prediction available for the provided name" });
+      return res
+        .status(200)
+        .json({
+          status: "error",
+          message: "No age prediction available for the provided name",
+        });
     }
 
-    // Validate Nationalize
     if (!nationalizeData.country || nationalizeData.country.length === 0) {
-      return res.status(200).json({ status: "error", message: "No nationality prediction available for the provided name" });
+      return res
+        .status(200)
+        .json({
+          status: "error",
+          message: "No nationality prediction available for the provided name",
+        });
     }
 
     const gender = genderData.gender;
@@ -121,35 +172,65 @@ app.post("/api/profiles", async (req, res) => {
     const sample_size = genderData.count;
     const age = agifyData.age;
     const age_group = getAgeGroup(age);
-
     const topCountry = nationalizeData.country.reduce((a, b) =>
-      a.probability > b.probability ? a : b
+      a.probability > b.probability ? a : b,
     );
     const country_id = topCountry.country_id;
     const country_probability = topCountry.probability;
-
     const id = uuidv7();
     const created_at = new Date().toISOString();
 
     await db.query(
       `INSERT INTO profiles (id, name, gender, gender_probability, sample_size, age, age_group, country_id, country_probability, created_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-      [id, trimmedName, gender, gender_probability, sample_size, age, age_group, country_id, country_probability, created_at]
+      [
+        id,
+        trimmedName,
+        gender,
+        gender_probability,
+        sample_size,
+        age,
+        age_group,
+        country_id,
+        country_probability,
+        created_at,
+      ],
     );
 
     return res.status(201).json({
       status: "success",
-      data: { id, name: trimmedName, gender, gender_probability, sample_size, age, age_group, country_id, country_probability, created_at },
+      data: {
+        id,
+        name: trimmedName,
+        gender,
+        gender_probability,
+        sample_size,
+        age,
+        age_group,
+        country_id,
+        country_probability,
+        created_at,
+      },
     });
-
   } catch (error) {
     console.error("POST error:", error.message);
-    if (error.request) return res.status(502).json({ status: "error", message: "External API did not respond in time" });
-    return res.status(500).json({ status: "error", message: "Internal server error: " + error.message });
+    if (error.request)
+      return res
+        .status(502)
+        .json({
+          status: "error",
+          message: "External API did not respond in time",
+        });
+    return res
+      .status(500)
+      .json({
+        status: "error",
+        message: "Internal server error: " + error.message,
+      });
   }
 });
 
-// GET /api/profiles — list all with optional filters
+// GET /api/profiles — with optional filters
 app.get("/api/profiles", async (req, res) => {
   const db = getPool();
   try {
@@ -179,7 +260,6 @@ app.get("/api/profiles", async (req, res) => {
       data: result.rows,
     });
   } catch (err) {
-    console.error("GET list error:", err.message);
     return res.status(500).json({ status: "error", message: "Database error" });
   }
 });
@@ -188,9 +268,13 @@ app.get("/api/profiles", async (req, res) => {
 app.get("/api/profiles/:id", async (req, res) => {
   const db = getPool();
   try {
-    const result = await db.query("SELECT * FROM profiles WHERE id = $1", [req.params.id]);
+    const result = await db.query("SELECT * FROM profiles WHERE id = $1", [
+      req.params.id,
+    ]);
     if (result.rows.length === 0) {
-      return res.status(404).json({ status: "error", message: "Profile not found" });
+      return res
+        .status(404)
+        .json({ status: "error", message: "Profile not found" });
     }
     return res.status(200).json({ status: "success", data: result.rows[0] });
   } catch (err) {
@@ -202,11 +286,18 @@ app.get("/api/profiles/:id", async (req, res) => {
 app.delete("/api/profiles/:id", async (req, res) => {
   const db = getPool();
   try {
-    const result = await db.query("DELETE FROM profiles WHERE id = $1 RETURNING *", [req.params.id]);
+    const result = await db.query(
+      "DELETE FROM profiles WHERE id = $1 RETURNING *",
+      [req.params.id],
+    );
     if (result.rows.length === 0) {
-      return res.status(404).json({ status: "error", message: "Profile not found" });
+      return res
+        .status(404)
+        .json({ status: "error", message: "Profile not found" });
     }
-    return res.status(200).json({ status: "success", message: "Profile deleted" });
+    return res
+      .status(200)
+      .json({ status: "success", message: "Profile deleted" });
   } catch (err) {
     return res.status(500).json({ status: "error", message: "Database error" });
   }
@@ -217,7 +308,9 @@ app.use((req, res) => {
 });
 
 initDB()
-  .then(() => app.listen(PORT, () => console.log(`Server running on port ${PORT}`)))
+  .then(() =>
+    app.listen(PORT, () => console.log(`Server running on port ${PORT}`)),
+  )
   .catch((err) => {
     console.error("Failed to init DB:", err.message);
     process.exit(1);
